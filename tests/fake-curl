@@ -1,0 +1,67 @@
+#!/usr/bin/env bash
+# Stands in for curl during the tests (SEEDANCE_CURL=tests/fake-curl).
+# It logs every call to $FAKE_STATE/calls and answers from a tiny fake API:
+#   POST .../videos/generations   202 {"request_id": "req-N"}; 503 once if $FAKE_STATE/busy-once exists
+#   GET  .../videos/req-N         pending on the first poll, done on the second; failed if $FAKE_STATE/fail exists
+#   GET  .../videos/req-N/content the bytes FAKEMP4
+#   POST .../media/uploads        an upload ticket
+#   PUT  https://storage.test/... 200
+#   GET  .../models               a model list
+set -euo pipefail
+method=GET url="" out="" write="" headers_out="" data="" auth=no ctype=-
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -X) method=$2; shift 2 ;;
+    -H)
+      case "$2" in
+        Authorization:*) auth=yes ;;
+        Content-Type:*) ctype=${2#Content-Type: } ;;
+      esac
+      shift 2 ;;
+    -o) out=$2; shift 2 ;;
+    -w) write=$2; shift 2 ;;
+    -D) headers_out=$2; shift 2 ;;
+    --data-binary)
+      if [ "$2" = "@-" ]; then data=$(cat); else data="<file ${2#@}>"; fi
+      shift 2 ;;
+    -*) shift ;;
+    *) url=$1; shift ;;
+  esac
+done
+
+state=${FAKE_STATE:?}
+printf '%s %s auth=%s type=%s\n' "$method" "$url" "$auth" "$ctype" >>"$state/calls"
+[ -z "$data" ] || printf '%s\n' "$data" >>"$state/bodies"
+
+code=200
+case "$method $url" in
+  "POST "*/videos/generations)
+    if [ -f "$state/busy-once" ]; then
+      rm "$state/busy-once"
+      code=503 body='{"error":{"type":"overloaded_error","code":"no_capacity","message":"no capacity right now"}}'
+    else
+      n=$(($(cat "$state/submits" 2>/dev/null || echo 0) + 1))
+      echo "$n" >"$state/submits"
+      code=202 body="{\"request_id\":\"req-$n\"}"
+    fi ;;
+  "GET "*/videos/req-*/content) body=FAKEMP4 ;;
+  "GET "*/videos/req-*)
+    id=${url##*/}
+    polls=$(($(cat "$state/polls-$id" 2>/dev/null || echo 0) + 1))
+    echo "$polls" >"$state/polls-$id"
+    if [ -f "$state/fail" ]; then
+      body="{\"request_id\":\"$id\",\"status\":\"failed\",\"error\":{\"code\":\"content_policy_violation\",\"message\":\"content review refused the prompt\",\"retryable\":false,\"field\":\"prompt\"}}"
+    elif [ "$polls" -lt 2 ]; then
+      body="{\"request_id\":\"$id\",\"status\":\"pending\",\"progress\":40,\"estimated_seconds_remaining\":90}"
+    else
+      body="{\"request_id\":\"$id\",\"status\":\"done\",\"progress\":100,\"usage\":{\"output_seconds\":5,\"reference_video_seconds\":0,\"billed_seconds\":5}}"
+    fi ;;
+  "POST "*/media/uploads) body='{"upload_url":"https://storage.test/put/1","media_url":"https://cdn.test/media/1"}' ;;
+  "PUT https://storage.test/"*) body="" ;;
+  "GET "*/models) body='{"object":"list","data":[{"id":"gpt-6-sol"},{"id":"seedance-2.5"},{"id":"seedance-2.0-mini"}]}' ;;
+  *) code=404 body='{"error":{"message":"no such route in the fake"}}' ;;
+esac
+
+[ -z "$headers_out" ] || printf 'HTTP/1.1 %s\r\nRetry-After: 0\r\n\r\n' "$code" >"$headers_out"
+if [ -n "$out" ]; then printf '%s' "$body" >"$out"; else printf '%s' "$body"; fi
+[ -z "$write" ] || printf '%s' "$code"

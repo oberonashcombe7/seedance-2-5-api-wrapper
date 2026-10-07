@@ -1,0 +1,444 @@
+#!/usr/bin/env bash
+# seedance25 - command-line wrapper for the ByteDance Seedance 2.5 video API.
+#
+# Needs bash 3.2+ (the macOS default works), curl and jq. MIT licensed.
+# Run `seedance25 help` for usage; README.md has the full reference.
+set -euo pipefail
+
+VERSION="0.1.0"
+MODEL="${SEEDANCE_MODEL:-seedance-2.5}"
+BASE="${SEEDANCE_BASE_URL:-https://argolink.io/v1}"
+BASE="${BASE%/}"
+POLL="${SEEDANCE_POLL_INTERVAL:-10}"
+WAIT_TIMEOUT="${SEEDANCE_TIMEOUT:-1800}"
+CURL="${SEEDANCE_CURL:-curl}"
+RETRIES=4
+
+# Per output second. Source: https://argolink.io/en/models/seedance-2.5, checked 2026-10-07.
+rate_for() { case "$1" in 480p) echo 0.0874 ;; 720p) echo 0.196 ;; 1080p) echo 0.483 ;; *) return 1 ;; esac; }
+official_for() { case "$1" in 480p) echo 0.1028 ;; 720p) echo 0.2311 ;; 1080p) echo 0.5686 ;; *) return 1 ;; esac; }
+
+die() { local code=$1; shift; printf 'seedance25: %s\n' "$*" >&2; exit "$code"; }
+note() { printf '%s\n' "$*" >&2; }
+need_value() { [ $# -ge 2 ] || die 1 "$1 needs a value"; }
+need_key() { [ -n "${SEEDANCE_API_KEY:-}" ] || die 1 "set SEEDANCE_API_KEY (create a key at https://argolink.io/app/keys)"; }
+
+command -v jq >/dev/null 2>&1 || die 1 "jq is required (https://jqlang.org)"
+command -v "$CURL" >/dev/null 2>&1 || die 1 "curl is required"
+
+TMP=$(mktemp -d "${TMPDIR:-/tmp}/seedance25.XXXXXX")
+trap 'rm -rf "$TMP"' EXIT
+
+usage() {
+  cat <<'EOF'
+seedance25 - Seedance 2.5 video API from the command line
+
+Usage:
+  seedance25 run [options] PROMPT         submit, wait and download in one go
+  seedance25 submit [options] PROMPT      start a job and print its request_id
+  seedance25 status REQUEST_ID            print the job as JSON
+  seedance25 wait REQUEST_ID              poll until done, failed or expired
+  seedance25 download REQUEST_ID [FILE]   save the finished MP4
+  seedance25 upload FILE                  upload a local file, print its media_url
+  seedance25 cost [options]               price a job offline
+  seedance25 batch FILE.jsonl [--parallel N] [--retry-failed] [--dry-run]
+  seedance25 models                       list the Seedance model IDs (no key needed)
+
+Job options:
+  -d, --duration N        4-30 seconds (default 5)
+  -r, --resolution R      480p, 720p or 1080p (default 720p)
+  -a, --aspect-ratio A    21:9 16:9 4:3 1:1 3:4 9:16 (default 16:9)
+      --first-frame X     first frame: https URL or local image
+      --last-frame X      last frame (needs --first-frame)
+      --image X           reference image, repeatable (up to 30)
+      --video X           reference video, repeatable (up to 10)
+      --audio X           reference audio, repeatable (up to 10)
+      --edit X            video to edit, 4-30 s (keeps its length and ratio)
+      --silent            no generated soundtrack
+      --body FILE         send this JSON body as it is (model is added if missing)
+  -o, --output FILE       where run saves the MP4 (default seedance-<request_id>.mp4)
+      --dry-run           print the request body; send and upload nothing
+Cost-only options:
+      --ref-seconds S     length of a reference video, repeatable
+      --edit-seconds S    length of the video being edited
+
+Environment: SEEDANCE_API_KEY (required for API calls), SEEDANCE_BASE_URL
+(default https://argolink.io/v1), SEEDANCE_POLL_INTERVAL (10), SEEDANCE_TIMEOUT (1800).
+Exit codes: 0 ok, 1 usage or validation, 2 HTTP error, 3 job failed, 4 job expired,
+5 still pending at the timeout.
+EOF
+}
+
+# api METHOD PATH [JSON]: print the response body; exit 2 on an API error.
+# 429 and 503 are never billed, so they are retried, honouring Retry-After.
+api() {
+  local method=$1 path=$2 body=${3-} attempt=0 status wait
+  need_key
+  while :; do
+    if [ -n "$body" ]; then
+      status=$(printf '%s' "$body" | "$CURL" -sS -X "$method" "$BASE$path" \
+        -H "Authorization: Bearer $SEEDANCE_API_KEY" -H "Content-Type: application/json" \
+        --data-binary @- -D "$TMP/headers" -o "$TMP/body" -w '%{http_code}') || die 2 "network error on $method $path"
+    else
+      status=$("$CURL" -sS -X "$method" "$BASE$path" -H "Authorization: Bearer $SEEDANCE_API_KEY" \
+        -D "$TMP/headers" -o "$TMP/body" -w '%{http_code}') || die 2 "network error on $method $path"
+    fi
+    case "$status" in
+      2??) cat "$TMP/body"; return 0 ;;
+      429 | 503)
+        if [ "$attempt" -lt "$RETRIES" ]; then
+          wait=$(awk 'tolower($1) == "retry-after:" { print $2 + 0 }' "$TMP/headers" | tail -n 1)
+          [ -n "$wait" ] || wait=$((5 * (1 << attempt)))
+          note "HTTP $status on $method $path, retrying in ${wait}s"
+          sleep "$wait"
+          attempt=$((attempt + 1))
+          continue
+        fi ;;
+    esac
+    die 2 "$method $path -> HTTP $status: $(jq -r '.error.message // .error // .' "$TMP/body" 2>/dev/null || cat "$TMP/body")"
+  done
+}
+
+content_type() {
+  case "$(printf '%s' "${1##*.}" | tr '[:upper:]' '[:lower:]')" in
+    jpg | jpeg) echo image/jpeg ;;
+    png) echo image/png ;;
+    mp4) echo video/mp4 ;;
+    mov) echo video/quicktime ;;
+    mp3) echo audio/mpeg ;;
+    wav) echo audio/wav ;;
+    *) return 1 ;;
+  esac
+}
+
+# upload FILE: ask for a media ticket, PUT the bytes (no API key goes to storage), print media_url.
+upload() {
+  local file=$1 type size ticket status
+  [ -f "$file" ] || die 1 "$file: no such file"
+  type=$(content_type "$file") || die 1 "$file: Seedance 2.5 reads JPEG, PNG, MP4, MOV, MP3 and WAV"
+  size=$(wc -c <"$file" | tr -d ' ')
+  ticket=$(api POST /media/uploads "$(jq -cn --arg m "$MODEL" --arg k "${type%%/*}" --arg t "$type" \
+    --argjson s "$size" '{model: $m, type: $k, content_type: $t, size_bytes: $s}')")
+  status=$("$CURL" -sS -X PUT "$(jq -r .upload_url <<<"$ticket")" -H "Content-Type: $type" \
+    --data-binary @"$file" -o /dev/null -w '%{http_code}') || die 2 "network error uploading $file"
+  case "$status" in 2??) ;; *) die 2 "upload of $file -> HTTP $status" ;; esac
+  jq -r .media_url <<<"$ticket"
+}
+
+# media X: an https URL stays as it is; a local file is uploaded (left as a path on --dry-run).
+media() {
+  case "$1" in
+    https://*) printf '%s\n' "$1" ;;
+    http://*) die 1 "$1: media URLs must use https" ;;
+    *)
+      [ -f "$1" ] || die 1 "$1: not an https URL and not a local file"
+      if [ "$DRY" = 1 ]; then printf '%s\n' "$1"; else note "uploading $1"; upload "$1"; fi ;;
+  esac
+}
+
+parse_job() {
+  PROMPT="" DURATION="" RESOLUTION="720p" RATIO="" FIRST="" LAST="" EDIT="" SILENT=0
+  BODY_FILE="" OUTPUT="" DRY=0 EDIT_SECONDS=""
+  IMAGES=() VIDEOS=() AUDIOS=() REF_SECONDS=()
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -d | --duration) need_value "$@"; DURATION=$2; shift 2 ;;
+      -r | --resolution) need_value "$@"; RESOLUTION=$2; shift 2 ;;
+      -a | --aspect-ratio) need_value "$@"; RATIO=$2; shift 2 ;;
+      --first-frame) need_value "$@"; FIRST=$2; shift 2 ;;
+      --last-frame) need_value "$@"; LAST=$2; shift 2 ;;
+      --image) need_value "$@"; IMAGES+=("$2"); shift 2 ;;
+      --video) need_value "$@"; VIDEOS+=("$2"); shift 2 ;;
+      --audio) need_value "$@"; AUDIOS+=("$2"); shift 2 ;;
+      --edit) need_value "$@"; EDIT=$2; shift 2 ;;
+      --silent) SILENT=1; shift ;;
+      --body) need_value "$@"; BODY_FILE=$2; shift 2 ;;
+      -o | --output) need_value "$@"; OUTPUT=$2; shift 2 ;;
+      --dry-run) DRY=1; shift ;;
+      --ref-seconds) need_value "$@"; REF_SECONDS+=("$2"); shift 2 ;;
+      --edit-seconds) need_value "$@"; EDIT_SECONDS=$2; shift 2 ;;
+      --) shift; PROMPT="$*"; break ;;
+      -*) die 1 "unknown option $1 (see seedance25 help)" ;;
+      *) [ -z "$PROMPT" ] || die 1 "give the prompt as one quoted argument"; PROMPT=$1; shift ;;
+    esac
+  done
+}
+
+validate_job() {
+  local references=$((${#IMAGES[@]} + ${#VIDEOS[@]} + ${#AUDIOS[@]}))
+  [ -n "$PROMPT" ] || die 1 "a prompt is required in every mode"
+  [ "$(printf '%s' "$PROMPT" | wc -c | tr -d ' ')" -le 40000 ] || die 1 "the prompt is over 40,000 bytes"
+  rate_for "$RESOLUTION" >/dev/null || die 1 "--resolution must be 480p, 720p or 1080p (4K is a Seedance 2.0 tier)"
+  if [ -n "$EDIT" ]; then
+    [ -z "$DURATION" ] || die 1 "an edit keeps the length of its video: drop --duration"
+    [ -z "$RATIO" ] || die 1 "an edit keeps the ratio of its video: drop --aspect-ratio"
+    [ -z "$FIRST$LAST" ] && [ "$references" -eq 0 ] || die 1 "an edit carries only the video it edits"
+    return 0
+  fi
+  DURATION=${DURATION:-5}
+  case "$DURATION" in '' | *[!0-9]*) die 1 "--duration takes whole seconds" ;; esac
+  [ "$DURATION" -ge 4 ] && [ "$DURATION" -le 30 ] || die 1 "--duration must be 4-30 seconds"
+  [ -z "$LAST" ] || [ -n "$FIRST" ] || die 1 "--last-frame needs --first-frame"
+  if [ -n "$FIRST" ]; then
+    [ "$references" -eq 0 ] || die 1 "frames cannot be combined with --image, --video or --audio"
+    [ -z "$RATIO" ] || [ "$RATIO" = adaptive ] || die 1 "frame jobs follow the first frame: drop --aspect-ratio"
+  else
+    case "${RATIO:-16:9}" in
+      21:9 | 16:9 | 4:3 | 1:1 | 3:4 | 9:16) ;;
+      *) die 1 "--aspect-ratio must be 21:9, 16:9, 4:3, 1:1, 3:4 or 9:16" ;;
+    esac
+  fi
+  [ "${#IMAGES[@]}" -le 30 ] || die 1 "at most 30 --image"
+  [ "${#VIDEOS[@]}" -le 10 ] || die 1 "at most 10 --video"
+  [ "${#AUDIOS[@]}" -le 10 ] || die 1 "at most 10 --audio"
+  [ "$references" -le 50 ] || die 1 "at most 50 references in total"
+}
+
+# job_body: validate, resolve media (uploading local files) and set JOB_BODY.
+job_body() {
+  local i
+  if [ -n "$BODY_FILE" ]; then
+    JOB_BODY=$(jq -c --arg m "$MODEL" '{model: $m} + .' "$BODY_FILE") || die 1 "$BODY_FILE is not valid JSON"
+    return 0
+  fi
+  validate_job
+  [ -z "$FIRST" ] || FIRST=$(media "$FIRST")
+  [ -z "$LAST" ] || LAST=$(media "$LAST")
+  [ -z "$EDIT" ] || EDIT=$(media "$EDIT")
+  for i in ${IMAGES[@]+"${!IMAGES[@]}"}; do IMAGES[$i]=$(media "${IMAGES[$i]}"); done
+  for i in ${VIDEOS[@]+"${!VIDEOS[@]}"}; do VIDEOS[$i]=$(media "${VIDEOS[$i]}"); done
+  for i in ${AUDIOS[@]+"${!AUDIOS[@]}"}; do AUDIOS[$i]=$(media "${AUDIOS[$i]}"); done
+  JOB_BODY=$(jq -cn --arg model "$MODEL" --arg prompt "$PROMPT" --arg res "$RESOLUTION" \
+    --arg duration "$DURATION" --arg ratio "$RATIO" --arg first "$FIRST" --arg last "$LAST" \
+    --arg edit "$EDIT" --argjson silent "$SILENT" \
+    --arg imgs "$(printf '%s\n' ${IMAGES[@]+"${IMAGES[@]}"})" \
+    --arg vids "$(printf '%s\n' ${VIDEOS[@]+"${VIDEOS[@]}"})" \
+    --arg auds "$(printf '%s\n' ${AUDIOS[@]+"${AUDIOS[@]}"})" '
+    def refs($list): $list | split("\n") | map(select(length > 0) | {url: .});
+    {model: $model, prompt: $prompt, resolution: $res}
+    + (if $edit != "" then {omni_reference_task_type: "edit", reference_videos: [{url: $edit}]}
+       else {duration: ($duration | tonumber)} end)
+    + (if $first != "" then {aspect_ratio: "adaptive", start_image: {url: $first}}
+       elif $edit == "" then {aspect_ratio: (if $ratio == "" then "16:9" else $ratio end)}
+       else {} end)
+    + (if $last != "" then {end_image: {url: $last}} else {} end)
+    + (if (refs($imgs) | length) > 0 then {reference_images: refs($imgs)} else {} end)
+    + (if (refs($vids) | length) > 0 then {reference_videos: refs($vids)} else {} end)
+    + (if (refs($auds) | length) > 0 then {reference_audios: refs($auds)} else {} end)
+    + (if $silent == 1 then {generate_audio: false} else {} end)')
+}
+
+# wait_job ID: print the final job JSON; return 3 failed, 4 expired, 5 timed out.
+wait_job() {
+  local id=$1 start job status
+  start=$(date +%s)
+  while :; do
+    job=$(api GET "/videos/$id")
+    status=$(jq -r .status <<<"$job")
+    case "$status" in
+      done) printf '%s\n' "$job"; return 0 ;;
+      failed)
+        note "$id failed: $(jq -r '(.error // {}) | "\(.code) (retryable: \(.retryable)) \(.message)"' <<<"$job")"
+        printf '%s\n' "$job"; return 3 ;;
+      expired) note "$id expired: nothing was produced or charged"; printf '%s\n' "$job"; return 4 ;;
+      pending)
+        note "$id pending $(jq -r '"\(.progress // 0)%" + (if .estimated_seconds_remaining then ", about \(.estimated_seconds_remaining) s left" else "" end)' <<<"$job")" ;;
+      *) die 2 "$id: unexpected status '$status'" ;;
+    esac
+    if [ $(($(date +%s) - start)) -ge "$WAIT_TIMEOUT" ]; then
+      note "$id still pending after ${WAIT_TIMEOUT}s; it keeps running: seedance25 wait $id"
+      return 5
+    fi
+    sleep "$POLL"
+  done
+}
+
+# download ID FILE: write the MP4 only when the API answers 200, never an error body.
+download() {
+  local id=$1 out=$2 status
+  need_key
+  status=$("$CURL" -sS -L "$BASE/videos/$id/content" -H "Authorization: Bearer $SEEDANCE_API_KEY" \
+    -o "$TMP/video" -w '%{http_code}') || die 2 "network error downloading $id"
+  case "$status" in
+    200 | 206) mv "$TMP/video" "$out" ;;
+    409) die 2 "$id is not done yet (job_video_not_ready); run: seedance25 wait $id" ;;
+    424) die 3 "$id failed (job_failed); run: seedance25 status $id" ;;
+    *) die 2 "download of $id -> HTTP $status: $(cat "$TMP/video")" ;;
+  esac
+}
+
+price() { # price SECONDS RESOLUTION -> dollars with 4 decimals
+  awk -v s="$1" -v r="$(rate_for "$2")" 'BEGIN { printf "%.4f", s * r }'
+}
+
+cmd_submit() {
+  parse_job "$@"
+  job_body
+  if [ "$DRY" = 1 ]; then jq . <<<"$JOB_BODY"; return 0; fi
+  api POST /videos/generations "$JOB_BODY" | jq -r .request_id
+}
+
+cmd_run() {
+  local id job rc=0 out billed res
+  parse_job "$@"
+  job_body
+  if [ "$DRY" = 1 ]; then jq . <<<"$JOB_BODY"; return 0; fi
+  id=$(api POST /videos/generations "$JOB_BODY" | jq -r .request_id)
+  note "submitted $id"
+  job=$(wait_job "$id") || rc=$?
+  [ "$rc" -eq 0 ] || exit "$rc"
+  out=${OUTPUT:-seedance-$id.mp4}
+  download "$id" "$out"
+  billed=$(jq -r '.usage.billed_seconds // empty' <<<"$job")
+  res=$(jq -r '.resolution // "720p"' <<<"$JOB_BODY")
+  if [ -n "$billed" ] && rate_for "$res" >/dev/null; then
+    printf 'saved %s (%s s billed at %s, $%s)\n' "$out" "$billed" "$res" "$(price "$billed" "$res")"
+  else
+    printf 'saved %s\n' "$out"
+  fi
+}
+
+cmd_status() { [ $# -eq 1 ] || die 1 "usage: seedance25 status REQUEST_ID"; api GET "/videos/$1" | jq .; }
+
+cmd_wait() {
+  local rc=0
+  [ $# -eq 1 ] || die 1 "usage: seedance25 wait REQUEST_ID"
+  wait_job "$1" | jq . || rc=${PIPESTATUS[0]}
+  exit "$rc"
+}
+
+cmd_download() {
+  [ $# -ge 1 ] && [ $# -le 2 ] || die 1 "usage: seedance25 download REQUEST_ID [FILE]"
+  download "$1" "${2:-seedance-$1.mp4}"
+  printf 'saved %s\n' "${2:-seedance-$1.mp4}"
+}
+
+cmd_upload() { [ $# -eq 1 ] || die 1 "usage: seedance25 upload FILE"; upload "$1"; }
+
+cmd_models() {
+  "$CURL" -fsS "$BASE/models" | jq -r '.data[].id | select(startswith("seedance"))'
+}
+
+cmd_cost() {
+  local output refs official
+  parse_job "$@"
+  rate_for "$RESOLUTION" >/dev/null || die 1 "--resolution must be 480p, 720p or 1080p"
+  official=$(official_for "$RESOLUTION")
+  if [ -n "$EDIT_SECONDS" ]; then
+    output=$EDIT_SECONDS refs=$EDIT_SECONDS
+  else
+    output=${DURATION:-5}
+    refs=$(printf '%s\n' ${REF_SECONDS[@]+"${REF_SECONDS[@]}"} | awk '{ s += $1 } END { print s + 0 }')
+  fi
+  awk -v o="$output" -v r="$refs" -v rate="$(rate_for "$RESOLUTION")" -v off="$official" -v res="$RESOLUTION" 'BEGIN {
+    billed = int(o + 0.5) + int(r)
+    printf "%d s billed at %s: $%.4f (official list price $%.4f)\n", billed, res, billed * rate, billed * off }'
+}
+
+# --- batch: one request body per line; state in FILE.state makes reruns resume ---------
+
+state_of() { # state_of STATE N -> "request_id status" of the latest record for line N
+  awk -F '\t' -v n="$2" '$1 == n { id = $2; st = $3 } END { if (id != "") print id, st }' "$1"
+}
+
+run_chunk() {
+  local file=$1 state=$2 n id st line body job rc out failures=0 pair
+  local pairs
+  pairs=()
+  shift 2
+  for n in "$@"; do
+    read -r id st <<<"$(state_of "$state" "$n")" || true
+    if [ -z "${id:-}" ] || [ "$st" = failed ] || [ "$st" = expired ]; then
+      line=$(sed -n "${n}p" "$file")
+      body=$(jq -c --arg m "$MODEL" '{model: $m} + del(.output)' <<<"$line") || die 1 "line $n is not valid JSON"
+      id=$(api POST /videos/generations "$body" | jq -r .request_id)
+      printf '%s\t%s\t%s\n' "$n" "$id" submitted >>"$state"
+      note "line $n -> $id"
+    fi
+    pairs+=("$n:$id")
+  done
+  for pair in "${pairs[@]}"; do
+    n=${pair%%:*} id=${pair#*:} rc=0
+    job=$(wait_job "$id") || rc=$?
+    case "$rc" in
+      0)
+        out=$(sed -n "${n}p" "$file" | jq -r --arg d "$(basename "$file" .jsonl)-$n.mp4" '.output // $d')
+        download "$id" "$out"
+        printf '%s\t%s\t%s\n' "$n" "$id" done >>"$state"
+        note "line $n saved $out ($(jq -r '.usage.billed_seconds' <<<"$job") s billed)" ;;
+      3) printf '%s\t%s\t%s\n' "$n" "$id" failed >>"$state"; failures=$((failures + 1)) ;;
+      4) printf '%s\t%s\t%s\n' "$n" "$id" expired >>"$state"; failures=$((failures + 1)) ;;
+      *) failures=$((failures + 1)) ;; # still pending: a rerun waits for it again
+    esac
+  done
+  return "$failures"
+}
+
+cmd_batch() {
+  local file="" parallel=5 dry=0 retry_failed=0 state n line id st total=0 failed=0 rc
+  local todo chunk
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --parallel) need_value "$@"; parallel=$2; shift 2 ;;
+      --retry-failed) retry_failed=1; shift ;;
+      --dry-run) dry=1; shift ;;
+      -*) die 1 "unknown option $1" ;;
+      *) file=$1; shift ;;
+    esac
+  done
+  [ -f "$file" ] || die 1 "usage: seedance25 batch FILE.jsonl [--parallel N] [--retry-failed] [--dry-run]"
+  case "$parallel" in '' | *[!0-9]*) die 1 "--parallel takes a number" ;; esac
+  [ "$parallel" -ge 1 ] && [ "$parallel" -le 50 ] || die 1 "--parallel must be 1-50: an account runs up to 50 jobs at once"
+
+  if [ "$dry" = 1 ]; then
+    jq -rs --argjson r "{\"480p\":$(rate_for 480p),\"720p\":$(rate_for 720p),\"1080p\":$(rate_for 1080p)}" '
+      map(select(type == "object")) as $jobs
+      | ($jobs | map((.duration // 5) * $r[.resolution // "720p"])) as $costs
+      | ($jobs | to_entries[] | "\(.value.output // "-")\t\(.value.duration // 5) s at \(.value.resolution // "720p")\t$\($costs[.key] * 10000 | round / 10000)"),
+        "total\t\($jobs | map(.duration // 5) | add) s\t$\($costs | add * 10000 | round / 10000) (reference-video seconds not included)"' \
+      < <(awk 'NF && $1 !~ /^#/' "$file")
+    return 0
+  fi
+
+  state="$file.state"
+  touch "$state"
+  todo=()
+  n=0
+  while IFS= read -r line || [ -n "$line" ]; do
+    n=$((n + 1))
+    case "$line" in '' | '#'*) continue ;; esac
+    read -r id st <<<"$(state_of "$state" "$n")" || true
+    case "${st:-}" in
+      done) continue ;;
+      failed | expired) [ "$retry_failed" = 1 ] || { failed=$((failed + 1)); continue; } ;;
+    esac
+    todo+=("$n")
+    id="" st=""
+  done <"$file"
+
+  chunk=()
+  for n in ${todo[@]+"${todo[@]}"}; do
+    chunk+=("$n")
+    total=$((total + 1))
+    if [ "${#chunk[@]}" -ge "$parallel" ]; then
+      rc=0; run_chunk "$file" "$state" "${chunk[@]}" || rc=$?
+      failed=$((failed + rc)); chunk=()
+    fi
+  done
+  if [ "${#chunk[@]}" -gt 0 ]; then
+    rc=0; run_chunk "$file" "$state" "${chunk[@]}" || rc=$?
+    failed=$((failed + rc))
+  fi
+  note "batch: $total job(s) run, $failed not done (see $state)"
+  [ "$failed" -eq 0 ] || exit 3
+}
+
+case "${1:-help}" in
+  run | submit | status | wait | download | upload | cost | batch | models)
+    command=$1
+    shift
+    "cmd_$command" "$@" ;;
+  help | -h | --help) usage ;;
+  version | -V | --version) echo "seedance25 $VERSION" ;;
+  *) die 1 "unknown command '$1' (see seedance25 help)" ;;
+esac

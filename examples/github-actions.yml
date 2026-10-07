@@ -1,0 +1,28 @@
+# Copy to .github/workflows/render.yml to render a clip on demand.
+# Needs a repository secret SEEDANCE_API_KEY. curl and jq are preinstalled on ubuntu-latest.
+name: Render a Seedance clip
+on:
+  workflow_dispatch:
+    inputs:
+      prompt:
+        description: What the clip should show
+        required: true
+      duration:
+        description: Seconds, 4-30
+        default: "5"
+jobs:
+  render:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - name: Render
+        env:
+          SEEDANCE_API_KEY: ${{ secrets.SEEDANCE_API_KEY }}
+          PROMPT: ${{ inputs.prompt }}
+          DURATION: ${{ inputs.duration }}
+        run: ./seedance25 run -d "$DURATION" -r 720p -o clip.mp4 "$PROMPT"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: clip
+          path: clip.mp4

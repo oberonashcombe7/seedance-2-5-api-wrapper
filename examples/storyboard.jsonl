@@ -1,0 +1,6 @@
+# A four-shot storyboard for `seedance25 batch examples/storyboard.jsonl`.
+# One request body per line; "output" names the file and is not sent to the API.
+{"prompt": "Establishing shot: a lighthouse on a cliff at dusk, waves crash below, slow push-in", "duration": 6, "resolution": "720p", "aspect_ratio": "21:9", "output": "shot-1-lighthouse.mp4"}
+{"prompt": "The keeper climbs the spiral stairs with a lantern, camera follows from below", "duration": 5, "resolution": "720p", "aspect_ratio": "21:9", "output": "shot-2-stairs.mp4"}
+{"prompt": "Close-up of the great lamp turning on, light sweeps across the fog", "duration": 4, "resolution": "720p", "aspect_ratio": "21:9", "output": "shot-3-lamp.mp4"}
+{"prompt": "A small fishing boat changes course toward the beam, wide shot from the sea", "duration": 8, "resolution": "720p", "aspect_ratio": "21:9", "generate_audio": false, "output": "shot-4-boat.mp4"}
